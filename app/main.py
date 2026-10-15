@@ -248,6 +248,14 @@ class PunchOutIn(BaseModel):
     punched_at: Optional[EpochMs] = None
 
 
+class RegularizeIn(BaseModel):
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
@@ -398,9 +406,96 @@ def list_attendance(
     }
 
 
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: str, body: RegularizeIn):
+    date = date_param(date, "date")
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if not rec:
+        raise HTTPException(404, "no attendance record for that date")
+
+    # 1. work out the final status and punch times
+    new_status = body.status or rec["status"]
+    if new_status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "ABSENT/LEAVE cannot have punch times")
+        new_in = new_out = None
+    else:
+        new_in = from_ms(body.punch_in) if body.punch_in is not None else rec.get("punch_in")
+        new_out = from_ms(body.punch_out) if body.punch_out is not None else rec.get("punch_out")
+        if new_in is None:
+            raise HTTPException(422, "a presence status requires a punch_in")
+        if attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != date:
+            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+        if new_out is not None:
+            if new_out <= new_in:
+                raise HTTPException(422, "punch_out must be after punch_in")
+            if new_out - new_in > timedelta(hours=24):
+                raise HTTPException(422, "punch_out is more than 24 hours after punch_in")
+
+    # 2. recompute the derived fields from the final values (R2-R5)
+    late = compute_late_minutes(new_in, date, emp["shift_start"]) if new_in else 0
+    if new_in and new_out:
+        hours = compute_work_hours(new_in, new_out)
+        overtime = compute_overtime(new_out, date, emp["shift_start"], emp["shift_end"])
+        half = compute_half_day(hours)
+    else:
+        hours, overtime, half = None, 0, False
+
+    new = {
+        "status": new_status,
+        "punch_in": new_in,
+        "punch_out": new_out,
+        "work_hours": hours,
+        "late_minutes": late,
+        "overtime_minutes": overtime,
+        "half_day": half,
+    }
+    old = {
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes", 0),
+        "overtime_minutes": rec.get("overtime_minutes", 0),
+        "half_day": rec.get("half_day", False),
+    }
+
+    # 3. keep only the fields that really changed
+    changes = {k: {"from": old[k], "to": new[k]} for k in new if old[k] != new[k]}
+    if not changes:
+        raise HTTPException(422, "the request changes nothing")
+
+    entry = {
+        "at": now_utc_ms(),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # 4. save, but only if nobody else changed the record since we read it
+    hist = rec.get("history")
+    guard = {
+        "_id": rec["_id"],
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "history": {"$size": len(hist)} if hist is not None else {"$exists": False},
+    }
+    updated = db.attendance_logs.find_one_and_update(
+        guard,
+        {"$set": new, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "record was changed by someone else, please retry")
+    return attendance_out(updated)
+
+
 # --------------------------------------------------------------------------- #
 # TODO
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/...
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
