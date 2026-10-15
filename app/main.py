@@ -3,6 +3,7 @@ Employee Attendance & Analytics API
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded; real environment variables win)
 """
+import calendar
 import os
 import re
 from contextlib import asynccontextmanager
@@ -27,6 +28,8 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+PRESENT_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +157,7 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 def check_date(value: str) -> str:
     if not DATE_RE.match(value):
         raise ValueError("must be YYYY-MM-DD")
-    date_cls.fromisoformat(value)  # raises ValueError for impossible dates
+    date_cls.fromisoformat(value)
     return value
 
 
@@ -165,6 +168,12 @@ def date_param(value: Optional[str], name: str) -> Optional[str]:
         return check_date(value)
     except ValueError:
         raise HTTPException(422, f"{name} must be a valid YYYY-MM-DD date")
+
+
+def validate_month(month: str) -> str:
+    if not MONTH_RE.match(month):
+        raise HTTPException(422, "month must be YYYY-MM")
+    return month
 
 
 def employee_out(d: dict) -> dict:
@@ -273,7 +282,7 @@ def create_employee(body: EmployeeIn):
     doc = body.model_dump()
     doc["created_at"] = now_utc_ms()
     try:
-        db.employees.insert_one(doc)  # the unique index decides, not a prior find
+        db.employees.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "emp_code already exists")
     return employee_out(doc)
@@ -321,7 +330,7 @@ def punch_in(body: PunchInIn):
         "history": [],
     }
     try:
-        db.attendance_logs.insert_one(doc)  # unique (emp_code, date) index
+        db.attendance_logs.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
     return attendance_out(doc)
@@ -333,8 +342,6 @@ def punch_out(body: PunchOutIn):
     if not emp:
         raise HTTPException(404, "employee not found")
     ts = from_ms(body.punched_at) if body.punched_at is not None else now_utc_seconds()
-
-    # most recent record whose punch_in is at or before the punch-out time
     rec = db.attendance_logs.find_one(
         {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
         sort=[("punch_in", DESCENDING)],
@@ -347,7 +354,6 @@ def punch_out(body: PunchOutIn):
         raise HTTPException(422, "punched_at must be after punch_in")
     if ts - rec["punch_in"] > timedelta(hours=24):
         raise HTTPException(422, "punched_at is more than 24 hours after punch_in")
-
     hours = compute_work_hours(rec["punch_in"], ts)
     update = {
         "punch_out": ts,
@@ -355,8 +361,6 @@ def punch_out(body: PunchOutIn):
         "overtime_minutes": compute_overtime(ts, rec["date"], emp["shift_start"], emp["shift_end"]),
         "half_day": compute_half_day(hours),
     }
-    # atomic: only succeeds if punch_out is still empty, so a second simultaneous
-    # punch-out finds nothing to update and gets 409
     updated = db.attendance_logs.find_one_and_update(
         {"_id": rec["_id"], "punch_out": None},
         {"$set": update},
@@ -415,8 +419,6 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
     rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
     if not rec:
         raise HTTPException(404, "no attendance record for that date")
-
-    # 1. work out the final status and punch times
     new_status = body.status or rec["status"]
     if new_status in ("ABSENT", "LEAVE"):
         if body.punch_in is not None or body.punch_out is not None:
@@ -434,8 +436,6 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
                 raise HTTPException(422, "punch_out must be after punch_in")
             if new_out - new_in > timedelta(hours=24):
                 raise HTTPException(422, "punch_out is more than 24 hours after punch_in")
-
-    # 2. recompute the derived fields from the final values (R2-R5)
     late = compute_late_minutes(new_in, date, emp["shift_start"]) if new_in else 0
     if new_in and new_out:
         hours = compute_work_hours(new_in, new_out)
@@ -443,7 +443,6 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
         half = compute_half_day(hours)
     else:
         hours, overtime, half = None, 0, False
-
     new = {
         "status": new_status,
         "punch_in": new_in,
@@ -462,20 +461,15 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
         "overtime_minutes": rec.get("overtime_minutes", 0),
         "half_day": rec.get("half_day", False),
     }
-
-    # 3. keep only the fields that really changed
     changes = {k: {"from": old[k], "to": new[k]} for k in new if old[k] != new[k]}
     if not changes:
         raise HTTPException(422, "the request changes nothing")
-
     entry = {
         "at": now_utc_ms(),
         "by": body.regularized_by,
         "reason": body.reason,
         "changes": changes,
     }
-
-    # 4. save, but only if nobody else changed the record since we read it
     hist = rec.get("history")
     guard = {
         "_id": rec["_id"],
@@ -495,7 +489,83 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
 
 
 # --------------------------------------------------------------------------- #
+# Analytics helpers
+# --------------------------------------------------------------------------- #
+def month_bounds(month: str):
+    y, m = int(month[:4]), int(month[5:7])
+    return y, m, calendar.monthrange(y, m)[1]
+
+
+def working_days_in_month(month: str, joined_on: str) -> int:
+    """R7: Mon-Fri days of the month, counted from joined_on for mid-month joiners."""
+    y, m, last = month_bounds(month)
+    first = max(date_cls(y, m, 1), date_cls.fromisoformat(joined_on))
+    end = date_cls(y, m, last)
+    count, day = 0, first
+    while day <= end:
+        if day.weekday() < 5:
+            count += 1
+        day += timedelta(days=1)
+    return count
+
+
+def monthly_pipeline(emp_code: str, month: str) -> list:
+    _, _, last = month_bounds(month)
+    return [
+        {"$match": {
+            "emp_code": emp_code,
+            "date": {"$gte": f"{month}-01", "$lte": f"{month}-{last:02d}"},
+        }},
+        {"$addFields": {
+            "dow": {"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}},
+        }},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": {"$cond": [
+                {"$and": [{"$in": ["$status", PRESENT_STATUSES]}, {"$lte": ["$dow", 5]}]},
+                {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+                0,
+            ]}},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+    rows = list(db.attendance_logs.aggregate(monthly_pipeline(emp_code, month)))
+    r = rows[0] if rows else {}
+    working = working_days_in_month(month, emp["joined_on"])
+    present = round_half_up(r.get("present_days", 0))
+    pct = None
+    if working > 0:
+        pct = round_half_up(Decimal(str(present)) / Decimal(working) * 100)
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working,
+        "present_days": present,
+        "leave_days": r.get("leave_days", 0),
+        "late_count": r.get("late_count", 0),
+        "total_late_minutes": r.get("total_late_minutes", 0),
+        "total_overtime_minutes": r.get("total_overtime_minutes", 0),
+        "attendance_pct": pct,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # TODO
-#   GET   /analytics/...
+#   GET   /analytics/departments/summary
+#   GET   /analytics/leaderboard/late
+#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
